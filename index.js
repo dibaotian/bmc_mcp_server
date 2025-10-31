@@ -1147,27 +1147,62 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "power_cycle": {
-        // 有些 BMC 不支持 PowerCycle，所以使用 ForceOff + On 的方式
+        // 智能 PowerCycle：先检查电源状态，然后根据状态执行相应操作
         try {
-          // 先强制关机
-          await setPowerAction(bmcIp, username, password, "ForceOff");
-          // 等待 2 秒确保完全关机
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          // 然后开机
-          await setPowerAction(bmcIp, username, password, "On");
+          // 1. 先获取当前电源状态
+          const currentState = await getPowerState(bmcIp, username, password);
           
-          return {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify({
-                  success: true,
-                  action: "PowerCycle (ForceOff + On)",
-                  message: "Successfully executed power cycle: ForceOff -> On"
-                }, null, 2)
-              }
-            ]
-          };
+          if (currentState.PowerState === "Off") {
+            // 如果已关机，直接开机
+            await setPowerAction(bmcIp, username, password, "On");
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    success: true,
+                    action: "PowerCycle (was Off, now On)",
+                    message: "Server was off, powered on successfully"
+                  }, null, 2)
+                }
+              ]
+            };
+          } else {
+            // 如果开机，先尝试直接使用 ForceRestart
+            try {
+              await setPowerAction(bmcIp, username, password, "ForceRestart");
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify({
+                      success: true,
+                      action: "PowerCycle (ForceRestart)",
+                      message: "Successfully executed ForceRestart"
+                    }, null, 2)
+                  }
+                ]
+              };
+            } catch (restartError) {
+              // 如果 ForceRestart 不支持，使用 ForceOff + On
+              await setPowerAction(bmcIp, username, password, "ForceOff");
+              await new Promise(resolve => setTimeout(resolve, 3000));
+              await setPowerAction(bmcIp, username, password, "On");
+              
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify({
+                      success: true,
+                      action: "PowerCycle (ForceOff + On)",
+                      message: "Successfully executed power cycle: ForceOff -> On"
+                    }, null, 2)
+                  }
+                ]
+              };
+            }
+          }
         } catch (error) {
           throw new Error(`Power cycle failed: ${error.message}`);
         }
