@@ -336,16 +336,16 @@ async function getPCIeDevices(bmcIp, username, password) {
  * 获取启动进度状态
  */
 async function getBootProgress(bmcIp, username, password) {
-  const { token, location } = await createSession(bmcIp, username, password);
+  const auth = await getAuthHeaders(bmcIp, username, password);
   
   try {
-    const url = `https://${bmcIp}/redfish/v1/Systems/1`;
+    // 自动检测 System ID
+    const systemId = await detectSystemId(bmcIp, auth.headers);
+    const url = `https://${bmcIp}/redfish/v1/Systems/${systemId}`;
+    
     const response = await fetch(url, {
       method: "GET",
-      headers: {
-        "X-Auth-Token": token,
-        "Content-Type": "application/json"
-      },
+      headers: auth.headers,
       agent
     });
 
@@ -354,9 +354,12 @@ async function getBootProgress(bmcIp, username, password) {
     }
 
     const data = await response.json();
-    return {
+    
+    // 构建返回结果
+    const result = {
+      Vendor: auth.vendor,
+      SystemId: systemId,
       PowerState: data.PowerState,
-      BootProgress: data.BootProgress,
       Status: data.Status,
       Boot: {
         BootSourceOverrideEnabled: data.Boot?.BootSourceOverrideEnabled,
@@ -365,8 +368,35 @@ async function getBootProgress(bmcIp, username, password) {
         BootOrder: data.Boot?.BootOrder
       }
     };
+    
+    // 如果有标准 BootProgress，添加它
+    if (data.BootProgress) {
+      result.BootProgress = data.BootProgress;
+    }
+    
+    // Dell 特殊处理：添加 OEM 状态信息
+    if (auth.vendor === 'Dell' && data.Oem?.Dell?.DellSystem) {
+      result.DellSystemStatus = {
+        CurrentRollupStatus: data.Oem.Dell.DellSystem.CurrentRollupStatus,
+        CPURollupStatus: data.Oem.Dell.DellSystem.CPURollupStatus,
+        FanRollupStatus: data.Oem.Dell.DellSystem.FanRollupStatus,
+        PSRollupStatus: data.Oem.Dell.DellSystem.PSRollupStatus,
+        TempRollupStatus: data.Oem.Dell.DellSystem.TempRollupStatus,
+        StorageRollupStatus: data.Oem.Dell.DellSystem.StorageRollupStatus,
+        MemoryOperationMode: data.Oem.Dell.DellSystem.MemoryOperationMode,
+        LastSystemInventoryTime: data.Oem.Dell.DellSystem.LastSystemInventoryTime,
+        Note: "Dell does not support standard BootProgress. Using OEM RollupStatus instead."
+      };
+    }
+    
+    // 如果没有 BootProgress 且不是 Dell，添加说明
+    if (!data.BootProgress && auth.vendor !== 'Dell') {
+      result.Note = "BootProgress not available on this system. Check Boot and Status fields for system state.";
+    }
+    
+    return result;
   } finally {
-    await deleteSession(bmcIp, token, location);
+    await auth.cleanup();
   }
 }
 
@@ -1147,20 +1177,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "power_cycle": {
-        // 智能 PowerCycle：先检查电源状态，然后根据状态执行相应操作
+        // 智能 PowerCycle：根据厂商和当前状态执行不同操作
         try {
-          // 1. 先获取当前电源状态
+          // 1. 先获取当前电源状态和厂商信息
           const currentState = await getPowerState(bmcIp, username, password);
+          const vendor = currentState.Vendor;
           
           if (currentState.PowerState === "Off") {
             // 如果已关机，直接开机
-            await setPowerAction(bmcIp, username, password, "On");
+            const result = await setPowerAction(bmcIp, username, password, "On");
             return {
               content: [
                 {
                   type: "text",
                   text: JSON.stringify({
                     success: true,
+                    vendor: vendor,
                     action: "PowerCycle (was Off, now On)",
                     message: "Server was off, powered on successfully"
                   }, null, 2)
@@ -1168,25 +1200,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               ]
             };
           } else {
-            // 如果开机，先尝试直接使用 ForceRestart
-            try {
-              await setPowerAction(bmcIp, username, password, "ForceRestart");
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: JSON.stringify({
-                      success: true,
-                      action: "PowerCycle (ForceRestart)",
-                      message: "Successfully executed ForceRestart"
-                    }, null, 2)
-                  }
-                ]
-              };
-            } catch (restartError) {
-              // 如果 ForceRestart 不支持，使用 ForceOff + On
+            // 如果开机，Dell 和 Lenovo 使用不同策略
+            if (vendor === "Dell") {
+              // Dell: 使用 ForceOff + 等待 + On
               await setPowerAction(bmcIp, username, password, "ForceOff");
-              await new Promise(resolve => setTimeout(resolve, 3000));
+              await new Promise(resolve => setTimeout(resolve, 5000)); // Dell 需要更长等待时间
               await setPowerAction(bmcIp, username, password, "On");
               
               return {
@@ -1195,12 +1213,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     type: "text",
                     text: JSON.stringify({
                       success: true,
+                      vendor: "Dell",
                       action: "PowerCycle (ForceOff + On)",
-                      message: "Successfully executed power cycle: ForceOff -> On"
+                      message: "Dell server power cycled: ForceOff -> wait 5s -> On"
                     }, null, 2)
                   }
                 ]
               };
+            } else {
+              // Lenovo: 先尝试 ForceRestart
+              try {
+                await setPowerAction(bmcIp, username, password, "ForceRestart");
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: JSON.stringify({
+                        success: true,
+                        vendor: vendor,
+                        action: "PowerCycle (ForceRestart)",
+                        message: "Successfully executed ForceRestart"
+                      }, null, 2)
+                    }
+                  ]
+                };
+              } catch (restartError) {
+                // 如果 ForceRestart 不支持，使用 ForceOff + On
+                await setPowerAction(bmcIp, username, password, "ForceOff");
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                await setPowerAction(bmcIp, username, password, "On");
+                
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: JSON.stringify({
+                        success: true,
+                        vendor: vendor,
+                        action: "PowerCycle (ForceOff + On)",
+                        message: "Successfully executed power cycle: ForceOff -> On"
+                      }, null, 2)
+                    }
+                  ]
+                };
+              }
             }
           }
         } catch (error) {
