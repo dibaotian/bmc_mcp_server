@@ -1,0 +1,25 @@
+{
+  "name": "bmc-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for BMC (Redfish) power control",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "bmc-mcp-server": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "mcp",
+    "bmc",
+    "redfish",
+    "power-control"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "node-fetch": "^3.3.2"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "bmc": {
+      "command": "node",
+      "args": [
+        "/home/xilinx/Documents/arnic_eng/mcp/bmc-server/index.js"
+      ],
+      "env": {
+        "BMC_IP": "192.168.1.100",
+        "BMC_USER": "USERID",
+        "BMC_PASSWORD": "YourPassword"
+      }
+    }
+  }
+}
