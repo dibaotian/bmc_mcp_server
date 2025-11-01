@@ -198,45 +198,58 @@ async function getPowerState(bmcIp, username, password) {
  * 获取 PCIe 设备信息
  */
 async function getPCIeDevices(bmcIp, username, password) {
-  const { token, location } = await createSession(bmcIp, username, password);
+  const auth = await getAuthHeaders(bmcIp, username, password);
   
   try {
     const devicesList = [];
     let devicesData = null;
+    let usedEndpoint = null;
     
-    // 尝试多个可能的 PCIe 设备端点
+    // 自动检测 Chassis ID
+    const chassisUrl = `https://${bmcIp}/redfish/v1/Chassis`;
+    const chassisListResp = await fetch(chassisUrl, {
+      method: "GET",
+      headers: auth.headers,
+      agent
+    });
+    
+    let chassisId = "1"; // 默认值
+    if (chassisListResp.ok) {
+      const chassisListData = await chassisListResp.json();
+      if (chassisListData.Members && chassisListData.Members.length > 0) {
+        // 获取第一个 chassis，通常是主系统机箱
+        chassisId = chassisListData.Members[0]['@odata.id'].split('/').pop();
+      }
+    }
+    
+    // 尝试多个可能的 PCIe 设备端点（优先 Chassis 路径，Dell 服务器使用此路径）
     const possibleEndpoints = [
-      '/redfish/v1/Systems/1/PCIeDevices',
-      '/redfish/v1/Chassis/1/PCIeDevices',
-      '/redfish/v1/Systems/Self/PCIeDevices'
+      `/redfish/v1/Chassis/${chassisId}/PCIeDevices`,  // Dell 使用此路径
+      '/redfish/v1/Systems/1/PCIeDevices',              // Lenovo 可能使用
+      '/redfish/v1/Chassis/1/PCIeDevices',              // 备用
     ];
     
     for (const endpoint of possibleEndpoints) {
       const devicesUrl = `https://${bmcIp}${endpoint}`;
       const devicesResponse = await fetch(devicesUrl, {
         method: "GET",
-        headers: {
-          "X-Auth-Token": token,
-          "Content-Type": "application/json"
-        },
+        headers: auth.headers,
         agent
       });
 
       if (devicesResponse.ok) {
         devicesData = await devicesResponse.json();
+        usedEndpoint = endpoint;
         break;
       }
     }
 
     if (!devicesData) {
       // 如果标准端点都不可用，尝试从 Chassis 获取信息
-      const chassisUrl = `https://${bmcIp}/redfish/v1/Chassis/1`;
-      const chassisResponse = await fetch(chassisUrl, {
+      const chassisDetailUrl = `https://${bmcIp}/redfish/v1/Chassis/${chassisId}`;
+      const chassisResponse = await fetch(chassisDetailUrl, {
         method: "GET",
-        headers: {
-          "X-Auth-Token": token,
-          "Content-Type": "application/json"
-        },
+        headers: auth.headers,
         agent
       });
 
@@ -249,10 +262,7 @@ async function getPCIeDevices(bmcIp, username, password) {
           const slotsUrl = `https://${bmcIp}${chassisData.PCIeSlots['@odata.id']}`;
           const slotsResponse = await fetch(slotsUrl, {
             method: "GET",
-            headers: {
-              "X-Auth-Token": token,
-              "Content-Type": "application/json"
-            },
+            headers: auth.headers,
             agent
           });
           
@@ -274,6 +284,8 @@ async function getPCIeDevices(bmcIp, username, password) {
         }
         
         return {
+          Vendor: auth.vendor,
+          ChassisId: chassisId,
           Message: "Standard PCIe devices endpoint not available. Retrieved chassis and slot information:",
           ChassisInfo: {
             ChassisType: chassisData.ChassisType,
@@ -287,6 +299,8 @@ async function getPCIeDevices(bmcIp, username, password) {
       }
       
       return {
+        Vendor: auth.vendor,
+        ChassisId: chassisId,
         Message: "PCIe information not available on this BMC",
         Note: "This BMC may not support PCIe device enumeration via Redfish API"
       };
@@ -298,10 +312,7 @@ async function getPCIeDevices(bmcIp, username, password) {
         const deviceUrl = `https://${bmcIp}${member['@odata.id']}`;
         const deviceResponse = await fetch(deviceUrl, {
           method: "GET",
-          headers: {
-            "X-Auth-Token": token,
-            "Content-Type": "application/json"
-          },
+          headers: auth.headers,
           agent
         });
 
@@ -324,11 +335,14 @@ async function getPCIeDevices(bmcIp, username, password) {
     }
 
     return {
+      Vendor: auth.vendor,
+      ChassisId: chassisId,
+      ApiEndpoint: usedEndpoint,
       DeviceCount: devicesList.length,
       Devices: devicesList
     };
   } finally {
-    await deleteSession(bmcIp, token, location);
+    await auth.cleanup();
   }
 }
 
@@ -761,6 +775,231 @@ async function getPCIeDeviceBySlot(bmcIp, username, password, slotId) {
 }
 
 /**
+ * 获取存储控制器列表
+ */
+async function getStorageControllers(bmcIp, username, password) {
+  const auth = await getAuthHeaders(bmcIp, username, password);
+  
+  try {
+    // 自动检测 System ID
+    const systemId = await detectSystemId(bmcIp, auth.headers);
+    const url = `https://${bmcIp}/redfish/v1/Systems/${systemId}/Storage`;
+    
+    const response = await fetch(url, {
+      method: "GET",
+      headers: auth.headers,
+      agent
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to get storage controllers: ${response.status} ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    const controllers = [];
+    
+    // 获取每个存储控制器的详细信息
+    if (data.Members && data.Members.length > 0) {
+      for (const member of data.Members) {
+        const controllerUrl = `https://${bmcIp}${member['@odata.id']}`;
+        const controllerResp = await fetch(controllerUrl, {
+          method: "GET",
+          headers: auth.headers,
+          agent
+        });
+        
+        if (controllerResp.ok) {
+          const controllerData = await controllerResp.json();
+          controllers.push({
+            Id: controllerData.Id,
+            Name: controllerData.Name,
+            Status: controllerData.Status,
+            StorageControllers: controllerData.StorageControllers,
+            Drives: controllerData.Drives,
+            DriveCount: controllerData.Drives?.length || 0
+          });
+        }
+      }
+    }
+    
+    return {
+      Vendor: auth.vendor,
+      SystemId: systemId,
+      ControllerCount: controllers.length,
+      Controllers: controllers
+    };
+  } finally {
+    await auth.cleanup();
+  }
+}
+
+/**
+ * 获取所有硬盘/SSD信息
+ */
+async function getStorageDevices(bmcIp, username, password) {
+  const auth = await getAuthHeaders(bmcIp, username, password);
+  
+  try {
+    // 自动检测 System ID
+    const systemId = await detectSystemId(bmcIp, auth.headers);
+    const storageUrl = `https://${bmcIp}/redfish/v1/Systems/${systemId}/Storage`;
+    
+    const storageResp = await fetch(storageUrl, {
+      method: "GET",
+      headers: auth.headers,
+      agent
+    });
+
+    if (!storageResp.ok) {
+      throw new Error(`Failed to get storage information: ${storageResp.status} ${storageResp.statusText}`);
+    }
+
+    const storageData = await storageResp.json();
+    const allDrives = [];
+    
+    // 遍历每个存储控制器获取硬盘信息
+    if (storageData.Members && storageData.Members.length > 0) {
+      for (const member of storageData.Members) {
+        const controllerUrl = `https://${bmcIp}${member['@odata.id']}`;
+        const controllerResp = await fetch(controllerUrl, {
+          method: "GET",
+          headers: auth.headers,
+          agent
+        });
+        
+        if (controllerResp.ok) {
+          const controllerData = await controllerResp.json();
+          const controllerId = controllerData.Id;
+          
+          // 获取该控制器下的所有硬盘
+          if (controllerData.Drives && controllerData.Drives.length > 0) {
+            for (const driveRef of controllerData.Drives) {
+              const driveUrl = `https://${bmcIp}${driveRef['@odata.id']}`;
+              const driveResp = await fetch(driveUrl, {
+                method: "GET",
+                headers: auth.headers,
+                agent
+              });
+              
+              if (driveResp.ok) {
+                const driveData = await driveResp.json();
+                allDrives.push({
+                  ControllerId: controllerId,
+                  DriveId: driveData.Id,
+                  Name: driveData.Name,
+                  Manufacturer: driveData.Manufacturer,
+                  Model: driveData.Model,
+                  SerialNumber: driveData.SerialNumber,
+                  PartNumber: driveData.PartNumber,
+                  CapacityBytes: driveData.CapacityBytes,
+                  CapacityGB: driveData.CapacityBytes ? Math.round(driveData.CapacityBytes / 1024 / 1024 / 1024) : null,
+                  MediaType: driveData.MediaType,
+                  Protocol: driveData.Protocol,
+                  Status: driveData.Status,
+                  FailurePredicted: driveData.FailurePredicted,
+                  IndicatorLED: driveData.IndicatorLED,
+                  Location: driveData.Location
+                });
+              }
+            }
+          }
+        }
+      }
+    }
+    
+    return {
+      Vendor: auth.vendor,
+      SystemId: systemId,
+      TotalDrives: allDrives.length,
+      Drives: allDrives
+    };
+  } finally {
+    await auth.cleanup();
+  }
+}
+
+/**
+ * 获取单个硬盘的详细信息
+ */
+async function getDriveDetails(bmcIp, username, password, controllerId, driveId) {
+  const auth = await getAuthHeaders(bmcIp, username, password);
+  
+  try {
+    // 自动检测 System ID
+    const systemId = await detectSystemId(bmcIp, auth.headers);
+    
+    // 构建硬盘 URL
+    const driveUrl = `https://${bmcIp}/redfish/v1/Systems/${systemId}/Storage/${controllerId}/Drives/${driveId}`;
+    
+    const response = await fetch(driveUrl, {
+      method: "GET",
+      headers: auth.headers,
+      agent
+    });
+
+    if (!response.ok) {
+      // 如果找不到，尝试列出所有可用的硬盘
+      const storageUrl = `https://${bmcIp}/redfish/v1/Systems/${systemId}/Storage/${controllerId}`;
+      const storageResp = await fetch(storageUrl, {
+        method: "GET",
+        headers: auth.headers,
+        agent
+      });
+      
+      if (storageResp.ok) {
+        const storageData = await storageResp.json();
+        const availableDrives = storageData.Drives?.map(d => {
+          const parts = d['@odata.id'].split('/');
+          return parts[parts.length - 1];
+        }) || [];
+        
+        throw new Error(`Drive '${driveId}' not found in controller '${controllerId}'. Available drives: ${availableDrives.join(', ')}`);
+      }
+      
+      throw new Error(`Failed to get drive details: ${response.status} ${response.statusText}`);
+    }
+
+    const driveData = await response.json();
+    
+    return {
+      Vendor: auth.vendor,
+      SystemId: systemId,
+      ControllerId: controllerId,
+      DriveDetails: {
+        Id: driveData.Id,
+        Name: driveData.Name,
+        Manufacturer: driveData.Manufacturer,
+        Model: driveData.Model,
+        SerialNumber: driveData.SerialNumber,
+        PartNumber: driveData.PartNumber,
+        SKU: driveData.SKU,
+        Revision: driveData.Revision,
+        CapacityBytes: driveData.CapacityBytes,
+        CapacityGB: driveData.CapacityBytes ? Math.round(driveData.CapacityBytes / 1024 / 1024 / 1024) : null,
+        MediaType: driveData.MediaType,
+        Protocol: driveData.Protocol,
+        Status: driveData.Status,
+        FailurePredicted: driveData.FailurePredicted,
+        IndicatorLED: driveData.IndicatorLED,
+        HotspareType: driveData.HotspareType,
+        EncryptionAbility: driveData.EncryptionAbility,
+        EncryptionStatus: driveData.EncryptionStatus,
+        RotationSpeedRPM: driveData.RotationSpeedRPM,
+        BlockSizeBytes: driveData.BlockSizeBytes,
+        CapableSpeedGbs: driveData.CapableSpeedGbs,
+        NegotiatedSpeedGbs: driveData.NegotiatedSpeedGbs,
+        PredictedMediaLifeLeftPercent: driveData.PredictedMediaLifeLeftPercent,
+        Location: driveData.Location,
+        Links: driveData.Links,
+        Oem: driveData.Oem
+      }
+    };
+  } finally {
+    await auth.cleanup();
+  }
+}
+
+/**
  * 控制系统电源
  */
 async function setPowerAction(bmcIp, username, password, resetType) {
@@ -1117,6 +1356,85 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           required: ["bmc_ip", "password"]
         }
+      },
+      {
+        name: "get_storage_controllers",
+        description: "获取服务器存储控制器列表和基本信息",
+        inputSchema: {
+          type: "object",
+          properties: {
+            bmc_ip: {
+              type: "string",
+              description: "BMC IP 地址"
+            },
+            username: {
+              type: "string",
+              description: "BMC 用户名（默认：USERID）",
+              default: "USERID"
+            },
+            password: {
+              type: "string",
+              description: "BMC 密码"
+            }
+          },
+          required: ["bmc_ip", "password"]
+        }
+      },
+      {
+        name: "get_storage_devices",
+        description: "获取服务器所有硬盘/SSD设备信息，包括容量、型号、序列号、健康状态等",
+        inputSchema: {
+          type: "object",
+          properties: {
+            bmc_ip: {
+              type: "string",
+              description: "BMC IP 地址"
+            },
+            username: {
+              type: "string",
+              description: "BMC 用户名（默认：USERID）",
+              default: "USERID"
+            },
+            password: {
+              type: "string",
+              description: "BMC 密码"
+            }
+          },
+          required: ["bmc_ip", "password"]
+        }
+      },
+      {
+        name: "get_drive_details",
+        description: "获取指定硬盘的详细信息，包括SMART状态、加密状态、剩余寿命等",
+        inputSchema: {
+          type: "object",
+          properties: {
+            bmc_ip: {
+              type: "string",
+              description: "BMC IP 地址"
+            },
+            controller_id: {
+              type: "string",
+              description: "存储控制器ID（例如：'RAID', 'AHCI'）",
+              examples: ["RAID", "AHCI", "RAIDIntegrated"]
+            },
+            drive_id: {
+              type: "string",
+              description: "硬盘ID（例如：'0', 'Disk.Bay.0'）",
+              examples: ["0", "1", "Disk.Bay.0", "Disk.Bay.1"]
+            },
+            username: {
+              type: "string",
+              description: "BMC 用户名（默认：USERID）",
+              default: "USERID"
+            },
+            password: {
+              type: "string",
+              description: "BMC 密码"
+            }
+          },
+          required: ["bmc_ip", "controller_id", "drive_id", "password"]
+        }
       }
     ]
   };
@@ -1371,6 +1689,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: JSON.stringify(fans, null, 2)
+            }
+          ]
+        };
+      }
+
+      case "get_storage_controllers": {
+        const controllers = await getStorageControllers(bmcIp, username, password);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(controllers, null, 2)
+            }
+          ]
+        };
+      }
+
+      case "get_storage_devices": {
+        const devices = await getStorageDevices(bmcIp, username, password);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(devices, null, 2)
+            }
+          ]
+        };
+      }
+
+      case "get_drive_details": {
+        const controllerId = args.controller_id;
+        const driveId = args.drive_id;
+        if (!controllerId) {
+          throw new Error("controller_id parameter is required");
+        }
+        if (!driveId) {
+          throw new Error("drive_id parameter is required");
+        }
+        const driveDetails = await getDriveDetails(bmcIp, username, password, controllerId, driveId);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(driveDetails, null, 2)
             }
           ]
         };
